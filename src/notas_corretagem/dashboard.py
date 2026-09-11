@@ -1,3 +1,4 @@
+from collections import deque
 from io import BytesIO
 
 import pandas as pd
@@ -31,6 +32,7 @@ def get_engine():
 @st.cache_data(ttl=30)
 def load_trades() -> pd.DataFrame:
     query = select(
+        BrokerageTrade.id.label("trade_id"),
         BrokerageTrade.trading_date,
         BrokerageTrade.asset_name,
         BrokerageTrade.ticker,
@@ -75,6 +77,20 @@ def fmt_brl(value: float) -> str:
     return f"R$ {value:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
 
 
+def fmt_price(value: float) -> str:
+    return f"{value:,.4f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_pct(value: float) -> str:
+    return f"{value:,.2f}%".replace(",", "X").replace(".", ",").replace("X", ".")
+
+
+def fmt_qty(value: float) -> str:
+    if float(value).is_integer():
+        return str(int(value))
+    return fmt_price(value)
+
+
 def build_daily(trades: pd.DataFrame, costs: pd.DataFrame) -> pd.DataFrame:
     abs_value = trades["value"].abs()
     gross = trades.groupby("trading_date")["value"].sum().to_frame("gross_result")
@@ -84,7 +100,7 @@ def build_daily(trades: pd.DataFrame, costs: pd.DataFrame) -> pd.DataFrame:
     daily_costs = costs.groupby("trading_date")[["fees", "irrf"]].sum()
 
     daily = gross.join(volume).join(operations).join(daily_costs, how="left").fillna(0.0)
-    daily["net_result"] = daily["gross_result"] - daily["fees"] - daily["irrf"]
+    daily["net_result"] = daily["gross_result"] - daily["fees"]
     daily["cumulative"] = daily["net_result"].cumsum()
     return daily.sort_index()
 
@@ -98,11 +114,11 @@ def build_by_asset(trades: pd.DataFrame, costs: pd.DataFrame) -> pd.DataFrame:
 
     daily_asset_volume = abs_value.groupby([trades["trading_date"], trades["asset_name"]]).sum()
     daily_volume = abs_value.groupby(trades["trading_date"]).sum()
-    daily_fees = costs.groupby("trading_date")[["fees", "irrf"]].sum()
+    daily_fees = costs.groupby("trading_date")["fees"].sum()
 
     allocated = []
     for (day, asset), vol in daily_asset_volume.items():
-        day_fees = daily_fees.loc[day].sum() if day in daily_fees.index else 0.0
+        day_fees = daily_fees.loc[day] if day in daily_fees.index else 0.0
         allocated.append({"asset_name": asset, "allocated_costs": day_fees * vol / daily_volume.loc[day]})
     allocation = (
         pd.DataFrame(allocated, columns=["asset_name", "allocated_costs"])
@@ -119,6 +135,172 @@ def build_by_asset(trades: pd.DataFrame, costs: pd.DataFrame) -> pd.DataFrame:
     )
     by_asset["net_result"] = by_asset["gross_result"] - by_asset["allocated_costs"]
     return by_asset.sort_values("net_result", ascending=False)
+
+
+def _pair_round_turns(buys: list[dict], sells: list[dict]) -> tuple[list[dict], dict]:
+    """Casa compras contra vendas em FIFO; lotes de compra consecutivos que
+    abrem e fecham a mesma venda parcial são fundidos em um único pareamento."""
+    sell_queue = deque(
+        {"id": i, "quantity": s["quantity"], "total": s["quantity"], "value": s["value"]}
+        for i, s in enumerate(sells)
+    )
+    pairs: list[dict] = []
+    open_sell_id = None
+    leftover = {"quantity": 0, "value": 0.0, "sell_quantity": 0, "sell_value": 0.0}
+
+    for buy_id, buy in enumerate(buys):
+        total = buy["quantity"]
+        remaining = total
+        pair = {
+            "quantity": 0,
+            "buy_value": 0.0,
+            "buy_abs": 0.0,
+            "buy_ids": set(),
+            "sell_value": 0.0,
+            "sell_abs": 0.0,
+            "sell_ids": set(),
+            "opened_by": open_sell_id,
+            "closed_by": None,
+        }
+        while remaining > 0 and sell_queue:
+            sell = sell_queue[0]
+            matched = min(remaining, sell["quantity"])
+            pair["quantity"] += matched
+            pair["buy_value"] += buy["value"] * matched / total
+            pair["buy_abs"] += abs(buy["value"]) * matched / total
+            pair["sell_value"] += sell["value"] * matched / sell["total"]
+            pair["sell_abs"] += abs(sell["value"]) * matched / sell["total"]
+            pair["buy_ids"].add(buy_id)
+            pair["sell_ids"].add(sell["id"])
+            remaining -= matched
+            sell["quantity"] -= matched
+            if sell["quantity"] == 0:
+                pair["closed_by"] = sell["id"]
+                sell_queue.popleft()
+
+        if pair["quantity"] > 0:
+            pairs.append(pair)
+        if remaining > 0:
+            leftover["quantity"] += remaining
+            leftover["value"] += buy["value"] * remaining / total
+        open_sell_id = sell_queue[0]["id"] if sell_queue else None
+
+    while sell_queue:
+        sell = sell_queue.popleft()
+        leftover["sell_quantity"] += sell["quantity"]
+        leftover["sell_value"] += sell["value"]
+
+    merged: list[dict] = []
+    for pair in pairs:
+        if pair["opened_by"] is not None and pair["opened_by"] == pair["closed_by"] and merged:
+            previous = merged[-1]
+            previous["quantity"] += pair["quantity"]
+            previous["buy_value"] += pair["buy_value"]
+            previous["buy_abs"] += pair["buy_abs"]
+            previous["buy_ids"] |= pair["buy_ids"]
+            previous["sell_value"] += pair["sell_value"]
+            previous["sell_abs"] += pair["sell_abs"]
+            previous["sell_ids"] |= pair["sell_ids"]
+        else:
+            merged.append(pair)
+    return merged, leftover
+
+
+OPERATION_COLUMNS = [
+    "trading_date",
+    "market",
+    "asset_name",
+    "quantity",
+    "direction",
+    "avg_price",
+    "final_price",
+    "profitability",
+    "result",
+]
+
+
+def build_closed_operations(trades: pd.DataFrame, costs: pd.DataFrame) -> pd.DataFrame:
+    """Pareia compras e vendas do mesmo ativo no mesmo pregão com os custos do
+    dia embutidos em cada perna, proporcionalmente ao valor financeiro."""
+    if trades.empty:
+        return pd.DataFrame(columns=OPERATION_COLUMNS)
+
+    day_fees = costs.groupby("trading_date")["fees"].sum()
+    day_volume = trades["value"].abs().groupby(trades["trading_date"]).sum()
+
+    rows = []
+    for (day, asset), group in trades.sort_values("trade_id").groupby(
+        ["trading_date", "asset_name"]
+    ):
+        market = group["market"].iloc[0]
+        buys = group[group["side"] == "C"].to_dict("records")
+        sells = group[group["side"] == "V"].to_dict("records")
+        pairs, leftover = _pair_round_turns(buys, sells)
+
+        fees = float(day_fees.loc[day]) if day in day_fees.index else 0.0
+        volume = float(day_volume.loc[day])
+
+        for pair in pairs:
+            buy_cost = fees * pair["buy_abs"] / volume
+            sell_cost = fees * pair["sell_abs"] / volume
+            result = pair["buy_value"] + pair["sell_value"] - buy_cost - sell_cost
+            if market == "BOVESPA":
+                buy_total = pair["buy_abs"] + buy_cost
+                sell_total = pair["sell_abs"] - sell_cost
+            else:
+                buy_total = pair["buy_value"] - buy_cost
+                sell_total = pair["sell_value"] - sell_cost
+            buy_avg = buy_total / pair["quantity"]
+            sell_avg = sell_total / pair["quantity"]
+            denominator = min(abs(buy_total), abs(sell_total))
+            profitability = 100 * result / denominator if denominator else float("nan")
+            buys_first = len(pair["buy_ids"]) <= len(pair["sell_ids"])
+            rows.append(
+                {
+                    "trading_date": day,
+                    "market": market,
+                    "asset_name": asset,
+                    "quantity": pair["quantity"],
+                    "direction": "C→V" if buys_first else "V→C",
+                    "avg_price": buy_avg if buys_first else sell_avg,
+                    "final_price": sell_avg if buys_first else buy_avg,
+                    "profitability": profitability,
+                    "result": result,
+                }
+            )
+
+        if leftover["quantity"] > 0:
+            rows.append(
+                {
+                    "trading_date": day,
+                    "market": market,
+                    "asset_name": asset,
+                    "quantity": leftover["quantity"],
+                    "direction": "C",
+                    "avg_price": abs(leftover["value"]) / leftover["quantity"],
+                    "final_price": float("nan"),
+                    "profitability": float("nan"),
+                    "result": float("nan"),
+                }
+            )
+        if leftover["sell_quantity"] > 0:
+            rows.append(
+                {
+                    "trading_date": day,
+                    "market": market,
+                    "asset_name": asset,
+                    "quantity": leftover["sell_quantity"],
+                    "direction": "V",
+                    "avg_price": abs(leftover["sell_value"]) / leftover["sell_quantity"],
+                    "final_price": float("nan"),
+                    "profitability": float("nan"),
+                    "result": float("nan"),
+                }
+            )
+
+    return pd.DataFrame(rows, columns=OPERATION_COLUMNS).sort_values(
+        ["trading_date", "asset_name"]
+    )
 
 
 def filter_trades(
@@ -190,7 +372,11 @@ def render_overview():
     col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Resultado líquido", fmt_brl(total_net))
     col2.metric("Custos operacionais", fmt_brl(total_fees))
-    col3.metric("IRRF day trade", fmt_brl(total_irrf))
+    col3.metric(
+        "IRRF day trade",
+        fmt_brl(total_irrf),
+        help="Antecipação de imposto compensável — não é deduzida do resultado líquido.",
+    )
     col4.metric("Volume operado", fmt_brl(total_volume))
     col5.metric("Dias positivos", f"{win_days}/{total_days}")
 
@@ -236,6 +422,56 @@ def render_overview():
     for col in ("Volume", "Resultado bruto", "Custos alocados", "Resultado líquido"):
         asset_table[col] = asset_table[col].map(fmt_brl)
     st.dataframe(asset_table, use_container_width=True, hide_index=True)
+
+    st.subheader("Operações finalizadas")
+    operations = build_closed_operations(filtered_trades, filtered_costs)
+    for market in ("BOVESPA", "BMF"):
+        block = operations[operations["market"] == market]
+        if block.empty:
+            continue
+        table = block.copy()
+        table["trading_date"] = table["trading_date"].dt.strftime("%d/%m/%Y")
+        table = table.rename(
+            columns={
+                "trading_date": "Data",
+                "asset_name": "Ativo",
+                "quantity": "Qtd.",
+                "direction": "C/V",
+                "avg_price": "C. Médio",
+                "final_price": "C. Final",
+                "profitability": "Lucratividade",
+                "result": "Resultado",
+            }
+        )
+        table["Qtd."] = table["Qtd."].map(fmt_qty)
+        for col in ("C. Médio", "C. Final"):
+            table[col] = table[col].map(lambda v: "—" if pd.isna(v) else fmt_price(v))
+        table["Lucratividade"] = table["Lucratividade"].map(
+            lambda v: "—" if pd.isna(v) else fmt_pct(v)
+        )
+        table["Resultado"] = table["Resultado"].map(
+            lambda v: "—" if pd.isna(v) else fmt_brl(v)
+        )
+        label = "Bovespa" if market == "BOVESPA" else "BM&F"
+        st.markdown(f"**{label}**")
+        st.dataframe(
+            table[
+                [
+                    "Data",
+                    "Ativo",
+                    "Qtd.",
+                    "C/V",
+                    "C. Médio",
+                    "C. Final",
+                    "Lucratividade",
+                    "Resultado",
+                ]
+            ],
+            use_container_width=True,
+            hide_index=True,
+        )
+        st.markdown(f"Subtotal **{label}:** {fmt_brl(block['result'].sum())}")
+    st.markdown(f"**Total:** {fmt_brl(operations['result'].sum())}")
 
     with st.expander("Detalhamento diário"):
         daily_table = daily.reset_index()

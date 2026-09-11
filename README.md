@@ -47,8 +47,10 @@ uv run pytest                                 # testes (parser + importer + dash
 O painel tem duas abas:
 
 - **Visão geral** — filtros de período/mercado/ativo, resultado líquido, custos
-  operacionais, IRRF, volume, dias positivos, gráfico diário + acumulado e
-  resultado por ativo (custos alocados proporcionalmente ao volume do dia).
+  operacionais, IRRF, volume, dias positivos, gráfico diário + acumulado,
+  resultado por ativo (custos alocados proporcionalmente ao volume do dia) e
+  operações finalizadas (pareamento compras×vendas por pregão com preços
+  médios líquidos dos custos embutidos por perna).
 - **Importar** — upload de PDFs com preview das negociações antes de gravar.
 
 ## Modelo de dados
@@ -63,6 +65,14 @@ O painel tem duas abas:
 Convenção de sinais: débito (D) negativo, crédito (C) positivo — em day trade o
 somatório dos valores de um ativo no dia é o resultado bruto. No BMF o valor por
 negócio já é o ajuste (P&L da perna), mesma convenção.
+
+O resultado líquido do painel é apurado antes do IRRF: a retenção de day trade
+é exibida separadamente como antecipação de imposto compensável, não como
+custo. A seção de operações finalizadas casa compras e vendas do mesmo ativo
+no mesmo pregão em FIFO (lotes consecutivos abertos e fechados pela mesma
+venda parcial são tratados como um único pareamento), com os custos do dia
+embutidos em cada perna proporcionalmente ao valor financeiro. No BMF os
+preços médios exibidos são os ajustes por contrato com sinal.
 
 A consistência é verificável por nota: `bruto − custos − IRRF = líquido`.
 
